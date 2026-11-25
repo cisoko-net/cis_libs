@@ -1,0 +1,244 @@
+-- Target abstraction.
+
+local Target = {}
+local CreatedZones = {}
+-- Which name-collisions have already been logged.
+local collisionWarned = {}
+local warnedMissing = false
+-- who asked for which target, so a consumer's stop removes its own zones through
+-- the provider, and only its own.
+local owned = CisOwned.new()
+
+local function targetEnabled()
+    return not (Config and Config.Framework and Config.Framework.Target and Config.Framework.Target.Enabled == false)
+end
+
+local function targetDebug()
+    return Config and Config.Framework and Config.Framework.Target and Config.Framework.Target.Debug
+end
+
+function Target.Available()
+    if not targetEnabled() then
+        return false
+    end
+    local ok, available = CisRegistry.call('target', 'available')
+    return ok and available == true
+end
+
+-- The one warning per session, not per call.
+local function missingOnce()
+    if warnedMissing then
+        return
+    end
+    warnedMissing = true
+    CisLog('warn', 'No target provider registered')
+end
+
+-- The create itself, for a given owner. Target.Create passes the invoker;
+-- Target.Update passes the target's existing owner, so cis_libs updating a
+-- consumer's target does not take it from that consumer.
+local function createAs(owner, zoneType, name, coords, size, options)
+    -- Refusals return a reason as a second value: a caller across the exports boundary
+    -- has no other way to learn why a request was turned away.
+    if not CisReadyState.wait(15000) then
+        return false, 'cis_libs never became ready'
+    end
+    options = options or {}
+    if not targetEnabled() then
+        return false, 'target disabled by config'
+    end
+    if type(name) ~= 'string' or name == '' then
+        return false, ('name arrived as %s'):format(type(name))
+    end
+    if coords == nil then
+        return false, 'coords arrived as nil (the exports boundary dropped them)'
+    end
+    if not Target.Available() then
+        missingOnce()
+        return false, 'no target provider started'
+    end
+    if zoneType ~= 'box' and zoneType ~= 'sphere' and zoneType ~= 'ped' then
+        return false, ('unknown zoneType %s'):format(tostring(zoneType))
+    end
+
+    local spec = {
+        zoneType = zoneType,
+        name = name,
+        coords = coords,
+        size = size,
+        rotation = options.rotation or 0,
+        debug = targetDebug(),
+        targetOptions = {
+            options = options.options or {},
+            distance = options.distance or 2.0,
+        },
+        -- Carried whole so the provider is handed the caller's entity handle rather
+        -- than only the fields copied above.
+        options = options,
+    }
+
+    -- REFUSED, WITH THE HOLDER NAMED -- same rule as zones, and the same reason
+    -- -- a name another resource holds is not taken over.
+    local holder = CreatedZones[name] and CreatedZones[name].owner
+    if holder and holder ~= owner then
+        -- Warn once per (name, holder, requester).
+        local key = table.concat({ name, tostring(holder), tostring(owner) }, '\29')
+        if not collisionWarned[key] then
+            collisionWarned[key] = true
+            CisLog('warn', ('target %q is already registered by %s; %s was refused. '
+                .. 'Further refusals for this name will not be logged again.')
+                :format(name, tostring(holder), tostring(owner)))
+        end
+        return false, ('target %q is already registered by %s; pick a different name')
+            :format(name, tostring(holder))
+    end
+
+    -- RESERVED before the provider is asked. The call crosses into another
+    -- resource and can yield, and a create of the same name that runs meanwhile
+    -- must find it held. A refusal puts back what was there.
+    local previous = CreatedZones[name]
+    spec.owner = owner
+    CreatedZones[name] = spec
+    local ok, reason = CisRegistry.call('target', 'create', spec)
+    if not ok or reason == false then
+        if CreatedZones[name] == spec then
+            CreatedZones[name] = previous
+        end
+        return false, ok and 'the target provider refused this request' or reason
+    end
+
+    CisOwned.track(owned, spec.owner, 'target', name)
+    return true
+end
+
+Target.Create = function(zoneType, name, coords, size, options)
+    -- Read HERE, while the export is executing and GetInvokingResource() still names
+    -- the caller.
+    return createAs(GetInvokingResource() or 'cis_libs', zoneType, name, coords, size, options)
+end
+
+-- ONLY THE OWNER, or cis_libs, may change a target. A target name is a string
+-- any resource can guess, and the provider removes whatever it is told to.
+local function refuseForeign(name)
+    local entry = CreatedZones[name]
+    if not entry then
+        return nil
+    end
+    local caller = GetInvokingResource() or 'cis_libs'
+    if caller ~= 'cis_libs' and caller ~= entry.owner then
+        return ('target %q belongs to %s, not %s'):format(tostring(name), tostring(entry.owner), caller)
+    end
+    return nil
+end
+
+-- Success is decided from our own bookkeeping, not from the provider's return: a name we
+-- hold is removed, and a name we do not hold is refused.
+Target.Remove = function(name, isPed)
+    local foreign = refuseForeign(name)
+    if foreign then
+        return false, foreign
+    end
+    if not Target.Available() then
+        CreatedZones[name] = nil
+        CisOwned.forget(owned, 'target', name)
+        return false, 'no target provider started'
+    end
+    local entry = CreatedZones[name]
+    if not entry then
+        return false, ('no target named %s'):format(tostring(name))
+    end
+    if isPed and not (entry.options and entry.options.entity) then
+        return false, 'target was not created for a local entity'
+    end
+
+    local ok, err = CisRegistry.call('target', 'remove', name, entry, isPed)
+    if not ok then
+        return false, err
+    end
+    CreatedZones[name] = nil
+    -- Removed the ordinary way, so the ledger stops owing it.
+    CisOwned.forget(owned, 'target', name)
+    return true
+end
+
+-- A CONSUMER THAT STOPS HAS ITS TARGETS REMOVED THROUGH THE PROVIDER.
+AddEventHandler('onResourceStop', function(resource)
+    -- A forged stop from another client script is ignored (shared/owned.lua).
+    if not CisRealStop(resource) then
+        return
+    end
+    if resource == GetCurrentResourceName() then
+        return
+    end
+    local freed = CisOwned.release(owned, resource)
+    local removed = 0
+    for i = 1, #freed do
+        if freed[i].kind == 'target' then
+            local entry = CreatedZones[freed[i].id]
+            local isPed = entry and entry.zoneType == 'ped'
+            pcall(function()
+                if Target.Available() and entry then
+                    CisRegistry.call('target', 'remove', freed[i].id, entry, isPed)
+                end
+                CreatedZones[freed[i].id] = nil
+                CisOwned.forget(owned, 'target', freed[i].id)
+                removed = removed + 1
+            end)
+        end
+    end
+    if removed > 0 then
+        CisLog('info', ('cis_libs: removed %d target(s) owned by %s'):format(removed, tostring(resource)))
+    end
+end)
+
+-- CHECKED FIRST, RESTORED ON A REFUSAL. This removed the old target and then
+-- created the new one with nothing in between, so a provider that refused the
+-- new options (or no provider at all) left the caller with no target and a
+-- bare false. The owner is the target's own, not the caller's.
+Target.Update = function(name, newOptions)
+    local old = CreatedZones[name]
+    if not old then
+        return false, ('no target named %s'):format(tostring(name))
+    end
+    local foreign = refuseForeign(name)
+    if foreign then
+        return false, foreign
+    end
+    if newOptions ~= nil and type(newOptions) ~= 'table' then
+        return false, ('newOptions must be a table, got %s'):format(type(newOptions))
+    end
+    if not targetEnabled() then
+        return false, 'target disabled by config'
+    end
+    if not Target.Available() then
+        missingOnce()
+        return false, 'no target provider started'
+    end
+    local removed, removeWhy = Target.Remove(name, old.zoneType == 'ped')
+    if not removed then
+        return false, removeWhy
+    end
+    local ok, err = createAs(old.owner, old.zoneType, name, old.coords, old.size, newOptions)
+    if ok then
+        return true
+    end
+    local restored = createAs(old.owner, old.zoneType, name, old.coords, old.size, old.options)
+    return false, ('update refused (%s); %s'):format(tostring(err),
+        restored and 'the old target was restored' or 'the old target could not be restored')
+end
+
+Target.Exists = function(name)
+    return CreatedZones[name] ~= nil
+end
+
+exports('CreateTarget', Target.Create)
+exports('RemoveTarget', Target.Remove)
+exports('UpdateTarget', Target.Update)
+exports('TargetExists', Target.Exists)
+exports('TargetAvailable', Target.Available)
+
+-- CisOwned.count answers ONE number across every kind, so a per-owner breakdown has to
+-- single total is all this reports.
+CisDiagnostics.Register('client', 'targets', function()
+    return { total = CisOwned.count(owned) }
+end)

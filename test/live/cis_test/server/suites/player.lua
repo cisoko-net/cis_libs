@@ -1,0 +1,237 @@
+-- The player tier, driven from the server.
+--
+-- The whole client suite runs in ONE operation on the client (snapshot, freeze,
+-- run, restore, verify) and the server only ever sees the envelope. That is
+-- deliberate: the plan's safety contract says the snapshot is taken before each
+-- client suite and restored after, and splitting those across several round
+-- trips would leave a window where the harness holds a snapshot of a player it
+-- is not looking after.
+--
+-- SKIP IS NOT PASS. With no player connected the tier reports SKIP with a
+-- reason and counts for nothing.
+
+local pending = {}
+
+RegisterNetEvent('cis_test:client_result', function(name, payload)
+    local waiter = pending[name]
+    if not waiter then
+        -- Answered for a request nobody is waiting on. That is a client running
+        -- a suite we did not ask for, and it is worth saying rather than
+        -- dropping, because a dropped answer looks like a hung client.
+        print(('[cis_test] client answered %q with nobody waiting for it'):format(tostring(name)))
+        return
+    end
+    pending[name] = nil
+    waiter(payload)
+end)
+
+-- How long ONE client suite gets before the harness calls it unanswered.
+-- Generous on purpose: the subject is a real person's game client, and an
+-- unfocused FiveM client throttles its own frame loop.
+local SUITE_TIMEOUT_MS = 60000
+
+-- Asks the client for one answer and waits for it.
+local function askClient(eventName, key, arg, timeoutMs)
+    local answered, payload = false, nil
+    pending[key] = function(p)
+        answered, payload = true, p
+    end
+
+    -- The lowest server id, matching the client's own subject selection, so the
+    -- server and the client cannot be talking about different people.
+    local src
+    for _, id in ipairs(GetPlayers()) do
+        local n = tonumber(id)
+        if n and (src == nil or n < src) then src = n end
+    end
+    if not src then return nil, 'no player connected' end
+
+    TriggerClientEvent(eventName, src, arg)
+
+    local deadline = GetGameTimer() + (timeoutMs or 30000)
+    while GetGameTimer() < deadline do
+        if answered then return payload end
+        Wait(50)
+    end
+    pending[key] = nil
+    return nil, ('the client did not answer %q within %d ms'):format(tostring(key), timeoutMs or 30000)
+end
+
+-- Asks the client to run one suite and waits for the answer.
+local function runClientSuite(suiteName, timeoutMs)
+    return askClient('cis_test:client_suite', '<suite:' .. tostring(suiteName) .. '>', suiteName, timeoutMs)
+end
+
+-- Every client suite the server knows about, asked for in turn.
+--
+-- 'exports' is FIRST on purpose. It only asks whether the client can see the
+-- exports the suites below are about to call, so when it fails the rest report
+-- failures against code that never ran -- which is how a zone P0 was reported
+-- twice in this project. The cost is a suite that cannot be wrong about
+-- anything except reachability.
+local CLIENT_SUITES = { 'exports', 'zones', 'debugtext', 'points', 'stage3', 'synchygiene', 'ui', 'cache' }
+
+CisTestRunner.Suite('player', { tier = 'player', realm = 'client', needsPlayer = true }, function(t)
+    t.case('every client suite runs, and the player is left as found', function()
+        local firstResult = nil
+
+        for _, suiteName in ipairs(CLIENT_SUITES) do
+            -- ONE RETRY, and a longer budget, because the subject is a real
+            -- person's game client and it is often not the focused window.
+            --
+            -- A FiveM client that is not in the foreground throttles its own
+            -- frame loop, so a suite that answers in 9 s on a focused client can
+            -- take 35 s on an unfocused one -- and 30 s of patience produced a
+            -- "did not answer" against a client that was working the whole time.
+            -- That is a support ticket written by the harness about the player.
+            --
+            -- The retry is bounded at one so a genuinely dead client still
+            -- fails, and it fails with the SECOND timeout rather than the first,
+            -- so the message says how long the client actually had.
+            local payload, why = runClientSuite(suiteName, SUITE_TIMEOUT_MS)
+            if not payload then
+                payload, why = runClientSuite(suiteName, SUITE_TIMEOUT_MS)
+                if payload then
+                    t.ok(true, ('client suite %q answered on the second attempt '
+                        .. 'after the first timed out at %d ms'):format(suiteName,
+                            SUITE_TIMEOUT_MS))
+                end
+            end
+
+            if not payload then
+                t.fail(('client suite %q did not answer'):format(suiteName), tostring(why))
+                goto continue
+            end
+
+            if payload.error then
+                t.fail(('client suite %q returned an error'):format(suiteName),
+                    tostring(payload.error))
+                goto continue
+            end
+
+            -- THE RESTORE IS THE CONTRACT. A suite whose cases all passed but
+            -- which left the player somewhere else is a failed run, and it is
+            -- checked before the cases so it cannot be buried under them.
+            t.eq(payload.restored, true,
+                ('the player was restored after %q'):format(suiteName))
+            if not payload.restored then
+                t.fail(('the restore after %q failed'):format(suiteName),
+                    tostring(payload.restoreWhy))
+                goto continue
+            end
+
+            for _, c in ipairs(payload.results or {}) do
+                local label = ('%s / %s'):format(suiteName, tostring(c.name))
+                -- Failures are reported through t.fail with the CLIENT's own
+                -- message as the detail. Asserting through t.eq instead loses it:
+                -- eq's detail is "expected true, got false", which is the same
+                -- for every client case and says nothing about which one or why.
+                -- The note goes through on the SUCCESS path too. That is the whole
+                -- point: a client case answers nil -- 'nothing spawned and nothing
+                -- was proved' -- when the client cannot stream the model, and that
+                -- explanation used to be discarded here, which made a run that
+                -- proved nothing indistinguishable from one that proved everything.
+                if c.ok then
+                    t.eq(true, true, label, c.msg)
+                else
+                    t.fail(label, tostring(c.msg))
+                end
+            end
+
+            firstResult = firstResult or payload
+        end
+
+        ::continue::
+        t.ok(firstResult ~= nil, 'at least one client suite answered')
+    end)
+
+    -- THE CLIENT'S SCRIPT ERRORS, without the client's log. A cis_libs loop that
+    -- raises on the client prints a SCRIPT ERROR to F8 and nowhere the driver
+    -- can read; its count is in the client's own diagnostics, so the server
+    -- asks for it. Run after the suites, so it covers everything they drove.
+    t.case('no cis_libs loop raised on the client during the run', function()
+        local health, why = askClient('cis_test:client_health', '<health>', nil, 15000)
+        if not health then
+            t.fail('the client answered its health check', tostring(why))
+            return
+        end
+        if health.error then
+            t.fail('the client answered its health check', tostring(health.error))
+            return
+        end
+        local raised = {}
+        for name, n in pairs(health.loops or {}) do
+            if type(n) == 'number' and n > 0 then raised[#raised + 1] = ('%s=%d'):format(name, n) end
+        end
+        table.sort(raised)
+        t.eq(#raised, 0, ('client loops that raised: %s'):format(#raised > 0 and table.concat(raised, ', ') or 'none'))
+        print(('[cis_test] client health: loops raised [%s], memory %.0f KB')
+            :format(table.concat(raised, ', '), tonumber(health.memoryKb) or -1))
+    end)
+end)
+
+-- A RAW SYNC PAYLOAD, delivered to one client on purpose.
+--
+-- The server refuses to SEND a malformed record any more -- that is 4.9 working
+-- -- so the only way to ask the client what it does when one arrives is to send
+-- one. The client suite cannot do that itself: `TriggerEvent` does not cross a
+-- resource boundary, so a record raised from cis_test never reached the
+-- handler in cis_libs and every refusal case passed without anything arriving.
+--
+-- HARNESS plumbing. It adds nothing to cis_libs and is not part of any contract.
+--
+-- The wire is a numbered batch, (n, upserts, removes), and a client applies an
+-- entry only if no later batch touched that key. The harness numbers its own
+-- batches far above anything the library's per-player counter reaches, so a raw
+-- record is never mistaken for a stale one.
+local rawBatch = 1000000000
+RegisterNetEvent('cis_test:rawSync', function(record)
+    rawBatch = rawBatch + 1
+    TriggerClientEvent('cis_libs:client:syncBatch', source, rawBatch, { record }, {})
+end)
+
+-- And the matching remove, so a successful spawn is cleaned up through the same
+-- route rather than by a local call that would not reach cis_libs either.
+RegisterNetEvent('cis_test:rawSyncRemove', function(key)
+    rawBatch = rawBatch + 1
+    TriggerClientEvent('cis_libs:client:syncBatch', source, rawBatch, {}, { key })
+end)
+
+-- THE ROUTING BUCKET IS SERVER STATE. GetPlayerRoutingBucket,
+-- SetPlayerRoutingBucket and GetEntityRoutingBucket are server natives; on the
+-- client they are nil. The client snapshot used to read and restore the bucket
+-- there, so it skipped the field every run and "the player is back where the
+-- harness found them" compared its fallback 0 with 0. The client asks here
+-- instead. The bucket the snapshot saw is kept on this side, keyed by the
+-- asking player's own id, so a restore can only put a player back into the
+-- bucket the server itself recorded for them.
+local bucketAtSnapshot = {}
+
+RegisterNetEvent('cis_test:bucket', function(op, nonce)
+    local src = source
+    if type(src) ~= 'number' or src <= 0 or type(nonce) ~= 'number' then return end
+    if op == 'snapshot' then
+        bucketAtSnapshot[src] = GetPlayerRoutingBucket(src)
+    elseif op == 'restore' then
+        local want = bucketAtSnapshot[src]
+        if want ~= nil then SetPlayerRoutingBucket(src, want) end
+    elseif op ~= 'read' then
+        return
+    end
+    TriggerClientEvent('cis_test:bucket', src, nonce, GetPlayerRoutingBucket(src))
+end)
+
+AddEventHandler('playerDropped', function()
+    bucketAtSnapshot[source] = nil
+end)
+
+
+-- WHAT THE CLIENT LOGGED. Printed, not stored: the point is that a person
+-- driving this from a machine cannot see F8, and a client-side refusal that
+-- says nothing is a refusal nobody can act on.
+RegisterNetEvent('cis_test:client_log', function(level, message)
+    print(('[cis_test:client] %s %s'):format(tostring(level), tostring(message)))
+end)
+
+
+exports('ClientSuites', function() return CLIENT_SUITES end)

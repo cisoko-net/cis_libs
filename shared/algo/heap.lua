@@ -1,0 +1,298 @@
+-- Binary min-heap, and the priority queue built on it.
+
+local M = {}
+
+--- Create an empty heap.
+---@param less? fun(a: any, b: any): boolean  `less(a, b)` must be a STRICT weak ordering: true
+---   when `a` comes out before `b`, false otherwise (so false for equal values). Leave it
+---   out to order by `<`.
+---@return table  the heap
+function M.new(less)
+    return {
+        items = {},
+        size = 0,
+        less = less,
+    }
+end
+
+local function before(h, a, b)
+    if h.less then
+        return h.less(a, b)
+    end
+    return a < b
+end
+
+-- Move the element at `index` up or down until the heap property holds.
+local function sift(h, index)
+    local items = h.items
+    local n = h.size
+    while true do
+        local left = index * 2
+        local right = left + 1
+        local smallest = index
+        if left <= n and before(h, items[left], items[smallest]) then
+            smallest = left
+        end
+        if right <= n and before(h, items[right], items[smallest]) then
+            smallest = right
+        end
+        if smallest == index then
+            return
+        end
+        items[index], items[smallest] = items[smallest], items[index]
+        index = smallest
+    end
+end
+
+--- Add a value.
+---
+--- nil is refused: it cannot be stored in the array part, so a pushed nil left
+--- `size` counting a slot that held nothing and the next sift compared nil. NaN
+--- is refused under the default ordering, where it compares false both ways
+--- and silently breaks the heap property for every later push.
+---@param h table
+---@param value any
+---@return integer|nil size  the new size, or nil when the value was refused
+---@return string|nil reason  why it was refused
+function M.push(h, value)
+    if value == nil then
+        return nil, 'cannot push nil into a heap'
+    end
+    if value ~= value and not h.less then
+        return nil, 'cannot push NaN into a heap ordered by <'
+    end
+    local n = h.size + 1
+    -- Sift UP from the new leaf. Walking up is what makes insert O(log n) and not O(n):
+    -- the new item is only compared with its ancestors, at most log n of them.
+    -- The comparator runs first and nothing is written until it is done, so a
+    -- comparator that raises leaves the heap as it was. Storing the item first
+    -- kept it, unordered, after the raise.
+    local items = h.items
+    local pos = n
+    while pos > 1 do
+        local parent = math.floor(pos * 0.5)
+        if before(h, value, items[parent]) then
+            pos = parent
+        else
+            break
+        end
+    end
+    local i = n
+    while i > pos do
+        local parent = math.floor(i * 0.5)
+        items[i] = items[parent]
+        i = parent
+    end
+    items[pos] = value
+    h.size = n
+    return n
+end
+
+--- Remove and return the minimum.
+---@param h table
+---@return any  nil when the heap is empty
+function M.pop(h)
+    if h.size < 1 then
+        return nil
+    end
+    local top = h.items[1]
+    local last = h.items[h.size]
+    h.items[h.size] = nil
+    h.size = h.size - 1
+    if h.size > 0 then
+        -- Move the last leaf to the root and sift it DOWN.
+        h.items[1] = last
+        sift(h, 1)
+    end
+    return top
+end
+
+--- The minimum, without removing it.
+---@param h table
+---@return any  nil when empty
+function M.peek(h)
+    if h.size < 1 then
+        return nil
+    end
+    return h.items[1]
+end
+
+--- Replace the minimum in place.
+---@param h table
+---@param value any  nil is refused, and NaN under the default ordering, as push refuses them
+---@return any  the new minimum; nil when the heap was empty or the value was refused
+---@return string|nil reason  why it was refused
+function M.replaceTop(h, value)
+    if h.size < 1 then
+        return nil
+    end
+    if value == nil then
+        return nil, 'cannot put nil into a heap'
+    end
+    if value ~= value and not h.less then
+        return nil, 'cannot put NaN into a heap ordered by <'
+    end
+    h.items[1] = value
+    -- Only ever sifts DOWN. Replacing the root can only make it too large for its
+    -- position relative to its children; it has no parent above it.
+    sift(h, 1)
+    return h.items[1]
+end
+
+--- Remove a specific value wherever it is.
+---@param h table
+---@param value any
+---@return boolean  whether the value was found and removed
+function M.remove(h, value)
+    local items = h.items
+    for i = 1, h.size do
+        if items[i] == value then
+            local last = items[h.size]
+            items[h.size] = nil
+            h.size = h.size - 1
+            if i <= h.size then
+                items[i] = last
+                -- The hole can break the property in EITHER direction: the value that
+                -- was moved in came from the last slot, a different branch of the tree.
+                local j = i
+                local moved = false
+                while j > 1 do
+                    local parent = math.floor(j * 0.5)
+                    if before(h, items[j], items[parent]) then
+                        items[j], items[parent] = items[parent], items[j]
+                        j = parent
+                        moved = true
+                    else
+                        break
+                    end
+                end
+                if not moved then
+                    sift(h, i)
+                end
+            end
+            return true
+        end
+    end
+    return false
+end
+
+--- How many values are queued. O(1).
+---@param h table
+---@return integer
+function M.size(h)
+    return h.size
+end
+
+--- Is the heap empty?
+---@param h table
+---@return boolean
+function M.isEmpty(h)
+    return h.size < 1
+end
+
+--- Drop everything. The backing array is replaced rather than nil-filled: a table does
+--- not give back its array memory when slots are set to nil, so the old array is dropped
+--- and the collector can take it.
+---@param h table
+---@return nil  it mutates the heap in place; there is nothing to hand back
+function M.clear(h)
+    h.items = {}
+    h.size = 0
+end
+
+--- Pop everything into a sorted array, cheapest element first.
+---@param h table
+---@return table  a NEW sorted array; the heap is left empty
+function M.drain(h)
+    local out = {}
+    local n = h.size
+    for i = 1, n do
+        out[i] = h.items[i]
+    end
+    table.sort(out, h.less)
+    h.items = {}
+    h.size = 0
+    return out
+end
+
+--- Build a heap from an existing list in O(n).
+---@param list table  array of values; a nil hole is skipped, and NaN under the default ordering
+---   is skipped too, because push would refuse both.
+---@param less? fun(a: any, b: any): boolean  as CisHeap.new
+---@return table  the heap
+function M.build(list, less)
+    local h = M.new(less)
+    if type(list) ~= 'table' then
+        return h
+    end
+    local n = 0
+    for i = 1, #list do
+        local v = list[i]
+        -- What push refuses would leave a nil in the array or break the ordering.
+        if v ~= nil and (v == v or less) then
+            n = n + 1
+            h.items[n] = v
+        end
+    end
+    h.size = n
+    for i = math.floor(n * 0.5), 1, -1 do
+        sift(h, i)
+    end
+    return h
+end
+
+
+--- A FIFO-ordered priority queue.
+---@return table  the queue; use enqueue / dequeue / peekQueue
+function M.newQueue()
+    local h = M.new(function(a, b)
+        if a.priority == b.priority then
+            return a.seq < b.seq
+        end
+        return a.priority < b.priority
+    end)
+    h.seq = 0
+    return h
+end
+
+--- Add a value at a priority. Lower sorts first.
+---@param q table
+---@param value any
+---@param priority? number  lower first; nil or NaN sorts last
+---@return integer  the new size
+function M.enqueue(q, value, priority)
+    if type(priority) ~= 'number' or priority ~= priority then
+        priority = math.huge
+    end
+    q.seq = q.seq + 1
+    return M.push(q, { value = value, priority = priority, seq = q.seq })
+end
+
+--- Remove and return the highest-priority (lowest number) value.
+---@param q table
+---@return any  nil when the queue is empty
+function M.dequeue(q)
+    local entry = M.pop(q)
+    if not entry then
+        return nil
+    end
+    return entry.value
+end
+
+--- The next value without removing it.
+---@param q table
+---@return any  nil when empty
+function M.peekQueue(q)
+    local entry = M.peek(q)
+    if not entry then
+        return nil
+    end
+    return entry.value
+end
+
+-- A MODULE, NOT A GLOBAL.
+if ... ~= 'cis_require' then
+    CisHeap = M
+end
+
+return M

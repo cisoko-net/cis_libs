@@ -1,0 +1,2 @@
+1.0.0
+cis_libs 1.0.0: see CHANGELOG.md at https://github.com/cisoko-net/cis_libs

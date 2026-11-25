@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" width="1200" height="300" role="img" aria-label="cis_libs: Zero-dependency base library for FiveM. cisoko.net">
+  <style>
+    .glow { animation: breathe 6s ease-in-out infinite; }
+    .layer { animation: pulse 4s ease-in-out infinite; stroke-opacity: 0; }
+    .l2 { animation-delay: .2s; }
+    .l3 { animation-delay: .4s; }
+    .shine { animation: shine 4s ease-in-out infinite; }
+    @keyframes breathe { 0%, 100% { opacity: .7; } 50% { opacity: 1; } }
+    @keyframes pulse { 0%, 20% { stroke-opacity: 0; } 35% { stroke-opacity: 1; } 65%, 100% { stroke-opacity: 0; } }
+    @keyframes shine { 0%, 30% { transform: translateX(-700px); } 75%, 100% { transform: translateX(700px); } }
+    @media (prefers-reduced-motion: reduce) {
+      .glow, .layer, .shine { animation: none; }
+    }
+  </style>
+  <defs>
+    <radialGradient id="g" cx="25%" cy="50%" r="75%">
+      <stop offset="0" stop-color="#D8A83E" stop-opacity=".24"/>
+      <stop offset=".5" stop-color="#D8A83E" stop-opacity=".05"/>
+      <stop offset="1" stop-color="#090909" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="s" x1="0" x2="1">
+      <stop offset="0" stop-color="#fff" stop-opacity="0"/>
+      <stop offset=".5" stop-color="#fff" stop-opacity=".55"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+    <clipPath id="t">
+      <text x="422" y="200" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="26" font-weight="500" letter-spacing="1">Zero-dependency base library for FiveM</text>
+    </clipPath>
+  </defs>
+  <rect width="1200" height="300" rx="10" fill="#090909"/>
+  <rect class="glow" width="1200" height="300" rx="10" fill="url(#g)"/>
+  <g fill="none" stroke="#D8A83E" stroke-width="5" stroke-linejoin="round" stroke-linecap="round" transform="translate(290 150) scale(.85)">
+    <polygon points="0,-64 76,-28 0,8 -76,-28"/>
+    <polyline points="-76,4 0,40 76,4"/>
+    <polyline points="-76,36 0,72 76,36"/>
+    <g stroke="#FFE3A3" stroke-width="6.5">
+      <polygon class="layer" points="0,-64 76,-28 0,8 -76,-28"/>
+      <polyline class="layer l2" points="-76,4 0,40 76,4"/>
+      <polyline class="layer l3" points="-76,36 0,72 76,36"/>
+    </g>
+  </g>
+  <text x="420" y="152" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="72" font-weight="700" fill="#F2F6FC" letter-spacing="-1">cis_libs</text>
+  <text x="422" y="200" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="26" font-weight="500" fill="#D8A83E" letter-spacing="1">Zero-dependency base library for FiveM</text>
+  <g clip-path="url(#t)">
+    <rect class="shine" x="422" y="170" width="260" height="40" fill="url(#s)"/>
+  </g>
+  <text x="1170" y="276" text-anchor="end" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="18" font-weight="500" fill="#8A8F98" letter-spacing="1">cisoko.net</text>
+</svg>

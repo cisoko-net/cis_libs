@@ -1,0 +1,159 @@
+-- Framework and database detection.
+
+CisDetect = {}
+
+-- Known frameworks, MOST SPECIFIC FIRST.
+CisDetect.FRAMEWORKS = {
+    { name = 'QBOX',   resource = 'qbx_core',     probe = 'GetPlayer'  },
+    { name = 'QBCORE', resource = 'qb-core',      probe = 'GetCoreObject' },
+    { name = 'ESX',    resource = 'es_extended',  probe = 'getSharedObject' },
+}
+
+-- Databases, same shape. First listed wins on AUTO.
+CisDetect.DATABASES = {
+    { name = 'oxmysql',       resource = 'oxmysql' },
+    { name = 'mysql-async',   resource = 'mysql-async' },
+    { name = 'ghmattimysql',  resource = 'ghmattimysql' },
+    { name = 'mongodb',       resource = 'mongodb' },
+}
+
+--- Decide which framework to use.
+--- @param configured string|nil  Config.Framework.Type, in any case
+--- @param custom table|nil       Config.Framework.Custom, the operator's own adapter
+--- @param isStarted function     isStarted(resource) -> boolean: true if running
+--- @param version function       version(resource) -> string|nil
+--- @param probe function         probe(resource, exportName) -> boolean
+--- @return table { name, resource, version, how, reason }
+function CisDetect.framework(configured, custom, isStarted, version, probe)
+    -- The NAME is compared in upper case; a RESOURCE is asked for as the operator
+    -- spelled it. Uppercasing it first asked for ND_CORE when ND_Core was running.
+    local spelled = tostring(configured or 'AUTO')
+    configured = spelled:upper()
+
+    -- A custom adapter wins over everything, including an explicit Type.
+    if type(custom) == 'table' and type(custom.resource) == 'string' and custom.resource ~= '' then
+        local res = custom.resource
+        if not isStarted(res) then
+            return {
+                name = 'NONE', resource = nil, version = nil, how = 'custom',
+                reason = ('custom framework %q is not started'):format(res),
+            }
+        end
+        local exportName = custom.getPlayer or custom.probe
+        if type(exportName) == 'string' and exportName ~= '' and not probe(res, exportName) then
+            return {
+                name = 'NONE', resource = nil, version = nil, how = 'custom',
+                reason = ('custom framework %q is started but exposes no %q export')
+                    :format(res, tostring(exportName)),
+            }
+        end
+        return {
+            name = (custom.name or 'CUSTOM'):upper(), resource = res,
+            version = version(res), how = 'custom',
+            reason = ('custom framework %q'):format(res),
+        }
+    end
+
+    -- An explicit, known Type is honoured even if nothing is started yet: the caller
+    -- has said what it wants; `reason` tells whether it is running.
+    if configured ~= 'AUTO' and configured ~= 'NONE' then
+        for _, known in ipairs(CisDetect.FRAMEWORKS) do
+            if known.name == configured then
+                local up = isStarted(known.resource) and true or false
+                return {
+                    name = known.name,
+                    resource = up and known.resource or nil,
+                    version = up and version(known.resource) or nil,
+                    how = 'configured',
+                    reason = up and ('configured as %s'):format(known.name)
+                        or ('configured as %s but %q is not started'):format(known.name, known.resource),
+                    wanted = true,
+                }
+            end
+        end
+        -- Configured with a name we do not know.
+        if configured ~= 'NONE' then
+            local up = isStarted(spelled) and true or false
+            return {
+                name = up and configured or 'NONE',
+                resource = up and spelled or nil,
+                version = up and version(spelled) or nil,
+                how = 'configured',
+                reason = up and ('configured as %s'):format(spelled)
+                    or ('configured as %s, which is not a known framework and is not started')
+                        :format(spelled),
+            }
+        end
+    end
+
+    if configured == 'NONE' then
+        return {
+            name = 'NONE', resource = nil, version = nil, how = 'configured',
+            reason = 'configured as NONE; no framework is used',
+        }
+    end
+
+    -- AUTO: ask the server what is actually running, most specific first.
+    for _, known in ipairs(CisDetect.FRAMEWORKS) do
+        if isStarted(known.resource) and probe(known.resource, known.probe) then
+            return {
+                name = known.name, resource = known.resource, version = version(known.resource),
+                how = 'detected',
+                reason = ('detected %s (%s) running'):format(known.resource, tostring(version(known.resource))),
+            }
+        end
+    end
+
+    return {
+        name = 'NONE', resource = nil, version = nil, how = 'detected',
+        reason = 'no supported framework is started',
+    }
+end
+
+--- Decide which database driver to use.
+function CisDetect.database(configured, isStarted, version)
+    configured = (configured or 'AUTO'):upper()
+
+    if configured == 'NONE' then
+        return {
+            name = 'NONE', resource = nil, version = nil, how = 'configured',
+            reason = 'configured as NONE; no database is used',
+        }
+    end
+
+    if configured ~= 'AUTO' then
+        for _, known in ipairs(CisDetect.DATABASES) do
+            -- `configured` was uppercased above and the list names are lowercase
+            -- resource names, so the comparison is made in ONE case.
+            if known.name:upper() == configured then
+                local up = isStarted(known.resource) and true or false
+                return {
+                    name = known.name, resource = up and known.resource or nil,
+                    version = up and version(known.resource) or nil,
+                    how = 'configured',
+                    reason = up and ('configured as %s'):format(known.name)
+                        or ('configured as %s but %q is not started'):format(known.name, known.resource),
+                }
+            end
+        end
+        return {
+            name = 'NONE', resource = nil, version = nil, how = 'configured',
+            reason = ('configured as %s, which is not a supported driver'):format(configured),
+        }
+    end
+
+    for _, known in ipairs(CisDetect.DATABASES) do
+        if isStarted(known.resource) then
+            return {
+                name = known.name, resource = known.resource, version = version(known.resource),
+                how = 'detected',
+                reason = ('detected %s running'):format(known.resource),
+            }
+        end
+    end
+
+    return {
+        name = 'NONE', resource = nil, version = nil, how = 'detected',
+        reason = 'no supported database driver is started',
+    }
+end

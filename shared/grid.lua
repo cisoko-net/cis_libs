@@ -1,0 +1,292 @@
+-- Spatial hash used by zones and doors. No natives; safe to unit-test.
+
+CisGrid = {
+    CELL = 64,
+    STRIDE = 65536,
+}
+
+local CELL = CisGrid.CELL
+local STRIDE = CisGrid.STRIDE
+
+-- The most cells one item may cover.
+local MAX_CELLS = 4096
+
+-- The largest |coordinate| an AABB may have. The map is about +-8000 m; an
+-- infinite bound made the cell loop a float loop whose step no longer changes
+-- the counter (the game thread hung), and past +-2^21 m the cell keys collide.
+CisGrid.LIMIT = 100000
+local LIMIT = CisGrid.LIMIT
+
+function CisGrid.cell(x, y)
+    return math.floor(x / CELL), math.floor(y / CELL)
+end
+
+-- A negative cell coordinate is a normal case, not a boundary: a player in the
+-- south or west of the origin has them, and the key stays unique for it.
+function CisGrid.key(cx, cy)
+    return cx + cy * STRIDE
+end
+
+function CisGrid.keyFromWorld(x, y)
+    local cx, cy = CisGrid.cell(x, y)
+    return CisGrid.key(cx, cy), cx, cy
+end
+
+function CisGrid.new()
+    return {
+        cells = {},
+        items = {},
+    }
+end
+
+-- Validate an AABB before anything walks it.
+local function checkAabb(aabb)
+    if type(aabb) ~= 'table' then
+        return nil, ('an AABB is required, got %s'):format(type(aabb))
+    end
+    local minX, maxX = aabb.minX, aabb.maxX
+    local minY, maxY = aabb.minY, aabb.maxY
+    -- An array, not a keyed table: ipairs walks 1..n, and a table built with string
+    -- A numeric for over all four, not ipairs: ipairs stopped at a nil bound, and
+    -- the inverted check below then raised "compare number with nil".
+    local bounds = { minX, maxX, minY, maxY }
+    for i = 1, 4 do
+        local v = bounds[i]
+        if type(v) ~= 'number' then
+            return nil, ('an AABB bound is %s, not a number'):format(type(v))
+        end
+        -- NaN passes every ordinary test: `NaN > x` is false, so both an inverted-AABB
+        -- check and the range check below would let it through.
+        if v ~= v then
+            return nil, 'the AABB has a NaN bound'
+        end
+        if v < -LIMIT or v > LIMIT then
+            return nil, ('the AABB has a bound of %s; at most %d metres from the origin is allowed')
+                :format(tostring(v), LIMIT)
+        end
+    end
+    -- minZ and maxZ may be nil -- queryPoint reads a nil z as "do not test z" -- but
+    -- Each z bound is checked on its own: ipairs over { nil, maxZ } stopped at the
+    -- nil and never looked at maxZ, and a string bound raised on every query of
+    -- its cell.
+    local minZ, maxZ = aabb.minZ, aabb.maxZ
+    for _, v in pairs({ minZ = minZ, maxZ = maxZ }) do
+        if type(v) ~= 'number' then
+            return nil, ('an AABB z bound is %s, not a number or nil'):format(type(v))
+        end
+        if v ~= v then
+            return nil, 'the AABB has a NaN z bound'
+        end
+        if v < -LIMIT or v > LIMIT then
+            return nil, ('the AABB has a z bound of %s; at most %d metres is allowed')
+                :format(tostring(v), LIMIT)
+        end
+    end
+    if minZ ~= nil and maxZ ~= nil and minZ > maxZ then
+        return nil, ('the AABB is inverted: minZ %s > maxZ %s'):format(tostring(minZ), tostring(maxZ))
+    end
+    if minX > maxX or minY > maxY then
+        return nil, ('the AABB is inverted: minX %s > maxX %s, minY %s > maxY %s')
+            :format(tostring(minX), tostring(maxX), tostring(minY), tostring(maxY))
+    end
+    return true
+end
+
+local function eachOverlappingCells(aabb, fn)
+    local minCx = math.floor(aabb.minX / CELL)
+    local maxCx = math.floor(aabb.maxX / CELL)
+    local minCy = math.floor(aabb.minY / CELL)
+    local maxCy = math.floor(aabb.maxY / CELL)
+    for cy = minCy, maxCy do
+        for cx = minCx, maxCx do
+            fn(CisGrid.key(cx, cy), cx, cy)
+        end
+    end
+end
+
+--- Would insert() take this AABB? The same checks, with nothing changed, so a
+--- caller replacing a record can ask BEFORE it tears the old one down.
+--- @return boolean, string|nil
+function CisGrid.admits(aabb)
+    local ok, why = checkAabb(aabb)
+    if not ok then
+        return false, why
+    end
+    -- The cell count is computed BEFORE the loop, not inside it, so the refusal happens
+    -- before any cell is visited.
+    local minCx = math.floor(aabb.minX / CELL)
+    local maxCx = math.floor(aabb.maxX / CELL)
+    local minCy = math.floor(aabb.minY / CELL)
+    local maxCy = math.floor(aabb.maxY / CELL)
+    local cols = maxCx - minCx + 1
+    local rows = maxCy - minCy + 1
+    -- Written as "not within", so a NaN count is refused rather than admitted.
+    if not (cols <= MAX_CELLS and rows <= MAX_CELLS and cols * rows <= MAX_CELLS) then
+        return false, ('the AABB covers %.0fx%.0f cells; at most %d are allowed. '
+            .. 'A size in metres read as a cell count lands here.')
+            :format(cols, rows, MAX_CELLS)
+    end
+    return true
+end
+
+-- insert() re-inserts rather than updating, so a caller that grows an AABB does not
+-- leave stale cells holding the id.
+function CisGrid.insert(grid, id, aabb, data)
+    local ok, why = CisGrid.admits(aabb)
+    if not ok then
+        return false, why
+    end
+
+    CisGrid.remove(grid, id)
+    local keys = {}
+    eachOverlappingCells(aabb, function(key)
+        local bucket = grid.cells[key]
+        if not bucket then
+            bucket = {}
+            grid.cells[key] = bucket
+        end
+        bucket[id] = true
+        keys[#keys + 1] = key
+    end)
+    grid.items[id] = {
+        aabb = aabb,
+        data = data,
+        keys = keys,
+    }
+    return true
+end
+
+function CisGrid.remove(grid, id)
+    local item = grid.items[id]
+    if not item then
+        return
+    end
+    for i = 1, #item.keys do
+        local key = item.keys[i]
+        local bucket = grid.cells[key]
+        if bucket then
+            bucket[id] = nil
+            if next(bucket) == nil then
+                grid.cells[key] = nil
+            end
+        end
+    end
+    grid.items[id] = nil
+end
+
+function CisGrid.clear(grid)
+    grid.cells = {}
+    grid.items = {}
+end
+
+-- Both queries below are exact.
+function CisGrid.queryPoint(grid, x, y, z, fn)
+    local key = CisGrid.keyFromWorld(x, y)
+    local bucket = grid.cells[key]
+    if not bucket then
+        return
+    end
+    for id in pairs(bucket) do
+        local item = grid.items[id]
+        if item then
+            local aabb = item.aabb
+            if x >= aabb.minX and x <= aabb.maxX and y >= aabb.minY and y <= aabb.maxY then
+                if z == nil or ((aabb.minZ == nil or z >= aabb.minZ)
+                    and (aabb.maxZ == nil or z <= aabb.maxZ)) then
+                    fn(id, item)
+                end
+            end
+        end
+    end
+end
+
+--- The smallest box containing every point.
+--- @return the box, or `nil, reason`. An EMPTY list is refused rather than returned as
+--- a box of infinities.
+function CisGrid.aabbFromPoints(points, minZ, maxZ, pad)
+    if type(points) ~= 'table' then
+        return nil, ('a point list is required, got %s'):format(type(points))
+    end
+    pad = pad or 0
+    local minX, minY = math.huge, math.huge
+    local maxX, maxY = -math.huge, -math.huge
+    for i = 1, #points do
+        local p = points[i]
+        local px, py = p.x or p[1], p.y or p[2]
+        if px ~= px or py ~= py then
+            return nil, ('point %d has a NaN coordinate'):format(i)
+        end
+        if px < minX then minX = px end
+        if py < minY then minY = py end
+        if px > maxX then maxX = px end
+        if py > maxY then maxY = py end
+    end
+    if minX == math.huge then
+        return nil, 'the point list is empty, so there is no box to build'
+    end
+    return {
+        minX = minX - pad,
+        minY = minY - pad,
+        maxX = maxX + pad,
+        maxY = maxY + pad,
+        minZ = (minZ or -1000) - pad,
+        maxZ = (maxZ or 10000) + pad,
+    }
+end
+
+function CisGrid.aabbFromCenter(x, y, z, hx, hy, hz)
+    return {
+        minX = x - hx,
+        minY = y - hy,
+        maxX = x + hx,
+        maxY = y + hy,
+        minZ = z - hz,
+        maxZ = z + hz,
+    }
+end
+
+-- Crossing number. Points on an edge and points on a vertex are not guaranteed inside;
+function CisGrid.pointInPolygon(x, y, points)
+    local inside = false
+    local j = #points
+    for i = 1, #points do
+        local pi, pj = points[i], points[j]
+        local xi, yi = pi.x or pi[1], pi.y or pi[2]
+        local xj, yj = pj.x or pj[1], pj.y or pj[2]
+        if (yi > y) ~= (yj > y) then
+            local denom = yj - yi
+            if denom ~= 0 then
+                local intersect = ((xj - xi) * (y - yi) / denom) + xi
+                if x < intersect then
+                    inside = not inside
+                end
+            end
+        end
+        j = i
+    end
+    return inside
+end
+
+function CisGrid.pointInSphere(x, y, z, cx, cy, cz, radius)
+    -- radius * radius is positive for a negative radius too, so -5 held a 5 m ball.
+    if radius < 0 then
+        return false
+    end
+    local dx, dy, dz = x - cx, y - cy, z - cz
+    return (dx * dx + dy * dy + dz * dz) <= (radius * radius)
+end
+
+function CisGrid.pointInBox(x, y, z, cx, cy, cz, hx, hy, hz, heading)
+    local dx, dy, dz = x - cx, y - cy, z - cz
+    if dz < -hz or dz > hz then
+        return false
+    end
+    if not heading or heading == 0 then
+        return dx >= -hx and dx <= hx and dy >= -hy and dy <= hy
+    end
+    local rad = heading * math.pi / 180.0
+    local c, s = math.cos(-rad), math.sin(-rad)
+    local lx = dx * c - dy * s
+    local ly = dx * s + dy * c
+    return lx >= -hx and lx <= hx and ly >= -hy and ly <= hy
+end

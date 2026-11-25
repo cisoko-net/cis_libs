@@ -1,0 +1,153 @@
+name: tests
+
+# Everything the repository gates on, in one script, so a local `npm run
+# test:all` and this workflow cannot drift. If a step here is not reachable
+# from that script, it is a step somebody has to remember to run.
+#
+# The mutation gate is the exception and runs in its own job, because it copies
+# the tree and runs the suite once per mutation: minutes rather than seconds,
+# which is too slow to sit in front of every push but too important to leave to
+# a nightly nobody reads.
+#
+# Every action is pinned by full commit SHA, with the tag it was taken from in a
+# trailing comment, so a moved or compromised tag cannot change what runs here.
+# To update one: git ls-remote --tags <repo> <tag>, take the commit (peel an
+# annotated tag with ^{}), and change the SHA and the comment together.
+#
+# The live server tier is the other exception: it boots a real FXServer, so it
+# needs the FIVEM_LICENSE_KEY secret, and a run without one (a fork's pull
+# request) skips it with a notice rather than failing.
+
+on:
+  # Pushes to main only. A branch with a pull request is tested by the
+  # pull_request event; listening to pushes on every branch as well ran the
+  # whole gate twice for each commit on a PR branch.
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Nightly, so a FiveM release that changes the natives cannot sit unnoticed
+    # until the next unrelated change happens to touch a native.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+# Read-only token. Nothing in this workflow writes to the repository.
+permissions:
+  contents: read
+
+# Superseded runs are cancelled rather than queued: ten pushes to a pull
+# request should cost the last one, not all ten. Keyed on the PR number when
+# there is one, so a PR's runs share a group whatever ref the event names.
+# The nightly run has a group of its own: its ref is main, the same as a push to
+# main, and a push would otherwise cancel the one run whose job is to notice a
+# FiveM release that changed the natives.
+concurrency:
+  group: tests-${{ github.event_name == 'schedule' && 'nightly' || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+env:
+  # luacheck 1.2.0 exactly. The lint result is part of the release gate, so a
+  # floating version means the gate means something different each month.
+  LUACHECK_VERSION: 1.2.0
+
+jobs:
+  test:
+    name: full gate (lint, realms, suites on two interpreters, api, generated files)
+    # Pinned on purpose, and written as a literal: `runs-on` is evaluated
+    # before the `env` context exists, so `${{ env.RUNNER }}` here is an
+    # error and the workflow never starts. `ubuntu-latest` moved under this
+    # file before, and a green run on two different images is not evidence
+    # about either of them.
+    runs-on: ubuntu-24.04
+    # test:all takes a few minutes. A hang is reported by the timeout, not by
+    # six hours of runner time.
+    timeout-minutes: 30
+    steps:
+      # v7 is the newest major of both actions (git ls-remote --tags, 2026-10).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Lua 5.4
+        # The suites run under BOTH fengari and a real interpreter. A real
+        # interpreter once found a seeded-RNG defect that only exists on a real one, so this is
+        # a correctness gate rather than a belt-and-braces extra. With CI set,
+        # test:lua54 FAILS when no interpreter is found instead of skipping.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lua5.4
+          lua5.4 -v
+
+      - name: Install luacheck
+        # luarocks, not apt: the apt package tracks whatever Ubuntu ships, and
+        # this repository's lint result is only meaningful at a known version.
+        run: |
+          sudo apt-get install -y -qq luarocks
+          sudo luarocks install luacheck "$LUACHECK_VERSION"
+          luacheck --version | head -1
+
+      - name: Run the full gate
+        # lint, generated-luacheck check, realm check, syntax, the suite under
+        # fengari, the same suite under Lua 5.4, the api validator and its own
+        # selftest, the generated-file check, docs, and the package build.
+        run: npm run test:all
+
+  mutate:
+    name: mutation gate, shard ${{ matrix.shard }}/20 (every known defect must break the suite)
+    runs-on: ubuntu-24.04
+    # Not on every push: it copies the tree and runs the suite once per row.
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    # One full suite run per mutation row, about 30 to 40 seconds each. Run as a
+    # single job the rows took hours and could not finish inside any sane
+    # timeout, so the table is split into 20 shards (tools/mutate.js --shard=K/N)
+    # and each shard holds a twentieth of the rows (about 42 at 829 rows,
+    # roughly 28 minutes). Raise the shard count, here, in the command below
+    # and in release.yml, when the rows grow past what 45 minutes covers.
+    timeout-minutes: 45
+    strategy:
+      # A survivor in one shard must not hide the others: every shard reports
+      # its own survivors, stale rows and errors.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Lua 5.4
+        # Rows with "check": "lua54" (M433, M434, M462, M463) run
+        # tools/run-lua54.js. Without an interpreter that script fails with "no
+        # Lua 5.4 interpreter found", which looks like a killed mutation
+        # whatever the mutation does. tools/mutate.js also refuses to count that
+        # case as killed, but the job must install the interpreter so the rows
+        # really test something.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lua5.4
+          lua5.4 -v
+
+      - name: Apply every mutation and require the suite to fail
+        # A mutation that still passes is a SURVIVOR and means the check it was
+        # written for does not exist. A row whose find no longer matches is
+        # STALE and means it stopped testing anything. Both fail the build.
+        # Every shard checks the whole table for duplicate ids before it picks
+        # its rows. The shards partition the rows (a test in tools-selftest), so
+        # together they run each row exactly once.
+        run: node tools/mutate.js --shard=${{ matrix.shard }}/20

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="110" height="20" role="img" aria-label="FXServer: 4500+">
+<title>FXServer: 4500+</title>
+<linearGradient id="s-badge-fxserver" x2="0" y2="100%"><stop offset="0" stop-color="#bbb" stop-opacity=".1"/><stop offset="1" stop-opacity=".1"/></linearGradient>
+<clipPath id="r-badge-fxserver"><rect width="110" height="20" rx="3" fill="#fff"/></clipPath>
+<g clip-path="url(#r-badge-fxserver)"><rect width="60" height="20" fill="#555"/><rect x="60" width="50" height="20" fill="#558760"/><rect width="110" height="20" fill="url(#s-badge-fxserver)"/></g>
+<g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" font-size="11" text-rendering="geometricPrecision">
+<text x="30" y="15" fill="#010101" fill-opacity=".3" textLength="50">FXServer</text><text x="30" y="14" textLength="50">FXServer</text><text x="85" y="15" fill="#010101" fill-opacity=".3" textLength="40">4500+</text><text x="85" y="14" textLength="40">4500+</text></g>
+</svg>
